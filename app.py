@@ -1,345 +1,329 @@
 """
-server/app.py
----------------
-FastAPI async backend for the flood rescue ecosystem.
+dashboard/app.py
+-------------------
+Streamlit + Folium NDRF-style tactical command map.
 
-Endpoints
----------
-POST /api/v1/sos/ingest_binary     Accept a raw 40-byte-max binary distress
-                                    packet (from BLE/LoRa gateways or direct
-                                    device upload), validate + persist it,
-                                    broadcast it to connected dashboards.
-GET  /api/v1/sos/active_distress   List unresolved distress records.
-POST /api/v1/sos/{id}/resolve      Mark a distress record resolved.
-GET  /api/v1/sar/flood_mask        Run the GEE SAR pipeline for given coords,
-                                    return a GeoJSON flood-water mask.
-POST /api/v1/route                 Compute a hazard-aware A* route.
-POST /api/v1/voice/triage          Upload a WAV recording; transcribe,
-                                    extract structured triage JSON.
-WS   /ws/distress                  Live push of newly ingested distress events.
+Run with:
+    streamlit run dashboard/app.py
+
+Talks to server/app.py over HTTP (DASHBOARD_API_BASE_URL). Renders:
+  - Live Sentinel-1 SAR flood-water GeoJSON layer
+  - SOS pins color-coded by urgency
+  - Turn-by-turn safe route overlay to a selected victim
+  - A live audio-recording widget that runs the offline ASR + triage
+    pipeline and dispatches a packed 40-byte distress packet
 """
 
 from __future__ import annotations
 
-import asyncio
-import sqlite3
-from contextlib import asynccontextmanager
+import time
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Optional
 
-import aiosqlite
-from fastapi import FastAPI, HTTPException, Request, UploadFile, File, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
+import folium
+import requests
+import streamlit as st
+from streamlit_folium import st_folium
 
 from core.config import settings
-from core.logger import get_logger
-from packet.binary_protocol import BinaryDistressProtocol, PacketValidationError
-from server.schemas import (
-    ActiveDistressList,
-    ActiveDistressRecord,
-    DistressIngestResponse,
-    FloodMaskRequest,
-    FloodMaskResponse,
-    RouteRequest,
-    RouteResponse,
-    VoiceTriageResponse,
-)
 
-logger = get_logger(__name__)
+st.set_page_config(page_title="Flood Rescue Command Dashboard", page_icon="🌊", layout="wide")
 
+API_BASE = settings.dashboard_api_base_url
 
-def _sqlite_path_from_url(database_url: str) -> str:
-    # Accepts URLs like "sqlite+aiosqlite:///./flood_rescue.db"
-    if "///" in database_url:
-        return database_url.split("///", 1)[1]
-    raise ValueError(f"Unsupported DATABASE_URL format: {database_url}")
+_URGENCY_COLORS = {
+    "CRITICAL": "red",
+    "HIGH": "orange",
+    "MEDIUM": "beige",
+    "LOW": "lightgray",
+}
+_NEED_COLOR_OVERRIDE = {
+    "MEDICAL": "red",
+    "FOOD_WATER": "yellow",
+}
 
 
-_DB_PATH = _sqlite_path_from_url(settings.database_url)
-
-_CREATE_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS distress_events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    latitude REAL NOT NULL,
-    longitude REAL NOT NULL,
-    urgency TEXT NOT NULL,
-    victim_count INTEGER NOT NULL,
-    need_code TEXT NOT NULL,
-    event_timestamp INTEGER NOT NULL,
-    device_id_hash INTEGER NOT NULL,
-    battery_level_0_15 INTEGER NOT NULL,
-    signal_strength_0_15 INTEGER NOT NULL,
-    received_via TEXT NOT NULL,
-    received_at TEXT NOT NULL,
-    resolved INTEGER NOT NULL DEFAULT 0
-);
-"""
-
-
-class ConnectionManager:
-    """Tracks active dashboard WebSocket clients and broadcasts JSON events."""
-
-    def __init__(self):
-        self._connections: set[WebSocket] = set()
-        self._lock = asyncio.Lock()
-
-    async def connect(self, websocket: WebSocket) -> None:
-        await websocket.accept()
-        async with self._lock:
-            self._connections.add(websocket)
-
-    async def disconnect(self, websocket: WebSocket) -> None:
-        async with self._lock:
-            self._connections.discard(websocket)
-
-    async def broadcast(self, message: dict) -> None:
-        async with self._lock:
-            dead = []
-            for ws in self._connections:
-                try:
-                    await ws.send_json(message)
-                except Exception:
-                    dead.append(ws)
-            for ws in dead:
-                self._connections.discard(ws)
-
-
-connection_manager = ConnectionManager()
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    Path(_DB_PATH).parent.mkdir(parents=True, exist_ok=True)
-    async with aiosqlite.connect(_DB_PATH) as db:
-        await db.execute(_CREATE_TABLE_SQL)
-        await db.commit()
-    logger.info("Database ready", extra={"context": {"path": _DB_PATH}})
-    yield
-    logger.info("Server shutting down")
-
-
-app = FastAPI(
-    title="Flood Rescue & Navigation API",
-    version="1.0.0",
-    lifespan=lifespan,
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.cors_origin_list,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-async def _insert_distress_record(decoded: dict, received_via: str) -> ActiveDistressRecord:
-    received_at = datetime.now(timezone.utc)
-    async with aiosqlite.connect(_DB_PATH) as db:
-        cursor = await db.execute(
-            """
-            INSERT INTO distress_events (
-                latitude, longitude, urgency, victim_count, need_code,
-                event_timestamp, device_id_hash, battery_level_0_15,
-                signal_strength_0_15, received_via, received_at, resolved
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
-            """,
-            (
-                decoded["latitude"],
-                decoded["longitude"],
-                decoded["urgency"],
-                decoded["victim_count"],
-                decoded["need_code"],
-                decoded["timestamp"],
-                decoded["device_id_hash"],
-                decoded["battery_level_0_15"],
-                decoded["signal_strength_0_15"],
-                received_via,
-                received_at.isoformat(),
-            ),
-        )
-        await db.commit()
-        new_id = cursor.lastrowid
-
-    return ActiveDistressRecord(
-        id=new_id,
-        latitude=decoded["latitude"],
-        longitude=decoded["longitude"],
-        urgency=decoded["urgency"],
-        victim_count=decoded["victim_count"],
-        need_code=decoded["need_code"],
-        timestamp=decoded["timestamp"],
-        device_id_hash=decoded["device_id_hash"],
-        battery_level_0_15=decoded["battery_level_0_15"],
-        signal_strength_0_15=decoded["signal_strength_0_15"],
-        received_via=received_via,
-        received_at=received_at,
-        resolved=False,
-    )
-
-
-@app.post("/api/v1/sos/ingest_binary", response_model=DistressIngestResponse)
-async def ingest_binary(request: Request):
-    """Accept a raw binary distress payload (application/octet-stream body)."""
-    raw_bytes = await request.body()
-    if not raw_bytes:
-        raise HTTPException(status_code=400, detail="Empty request body; expected raw binary packet.")
-
+def _api_get(path: str, **params) -> dict | None:
     try:
-        decoded = BinaryDistressProtocol.unpack_payload(raw_bytes)
-    except PacketValidationError as exc:
-        raise HTTPException(status_code=422, detail=f"Invalid packet: {exc}") from exc
-
-    received_via = request.headers.get("X-Received-Via", "http")
-    record = await _insert_distress_record(decoded, received_via)
-
-    await connection_manager.broadcast(
-        {"event_type": "distress_update", "payload": record.model_dump(mode="json")}
-    )
-
-    return DistressIngestResponse(**record.model_dump())
+        resp = requests.get(f"{API_BASE}{path}", params=params, timeout=20)
+        resp.raise_for_status()
+        return resp.json()
+    except requests.RequestException as exc:
+        st.error(f"API request failed: {path} -> {exc}")
+        return None
 
 
-@app.get("/api/v1/sos/active_distress", response_model=ActiveDistressList)
-async def active_distress(include_resolved: bool = False):
-    query = "SELECT * FROM distress_events"
-    if not include_resolved:
-        query += " WHERE resolved = 0"
-    query += " ORDER BY received_at DESC"
-
-    async with aiosqlite.connect(_DB_PATH) as db:
-        db.row_factory = sqlite3.Row
-        cursor = await db.execute(query)
-        rows = await cursor.fetchall()
-
-    records = [
-        ActiveDistressRecord(
-            id=row["id"],
-            latitude=row["latitude"],
-            longitude=row["longitude"],
-            urgency=row["urgency"],
-            victim_count=row["victim_count"],
-            need_code=row["need_code"],
-            timestamp=row["event_timestamp"],
-            device_id_hash=row["device_id_hash"],
-            battery_level_0_15=row["battery_level_0_15"],
-            signal_strength_0_15=row["signal_strength_0_15"],
-            received_via=row["received_via"],
-            received_at=datetime.fromisoformat(row["received_at"]),
-            resolved=bool(row["resolved"]),
-        )
-        for row in rows
-    ]
-    return ActiveDistressList(count=len(records), records=records)
-
-
-@app.post("/api/v1/sos/{distress_id}/resolve")
-async def resolve_distress(distress_id: int):
-    async with aiosqlite.connect(_DB_PATH) as db:
-        cursor = await db.execute(
-            "UPDATE distress_events SET resolved = 1 WHERE id = ?", (distress_id,)
-        )
-        await db.commit()
-        if cursor.rowcount == 0:
-            raise HTTPException(status_code=404, detail=f"Distress record {distress_id} not found.")
-    return {"id": distress_id, "resolved": True}
-
-
-@app.get("/api/v1/sar/flood_mask", response_model=FloodMaskResponse)
-async def flood_mask(latitude: float, longitude: float, reference_time: Optional[str] = None):
-    from geospatial.gee_sar_engine import SARFloodEngine, SARProcessingError, GEEInitializationError
-
-    ref_dt = datetime.fromisoformat(reference_time) if reference_time else None
-
+def _api_post_json(path: str, payload: dict) -> dict | None:
     try:
-        engine = SARFloodEngine()
-        result = await asyncio.to_thread(engine.generate_flood_mask, latitude, longitude, ref_dt)
-    except GEEInitializationError as exc:
-        raise HTTPException(status_code=503, detail=f"Earth Engine unavailable: {exc}") from exc
-    except SARProcessingError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-    return FloodMaskResponse(
-        geojson=result.geojson,
-        otsu_threshold_db=result.otsu_threshold_db,
-        aoi_bbox=result.aoi_bbox,
-        baseline_window=result.baseline_window,
-        postflood_window=result.postflood_window,
-        water_fraction=result.water_fraction,
-    )
+        resp = requests.post(f"{API_BASE}{path}", json=payload, timeout=30)
+        resp.raise_for_status()
+        return resp.json()
+    except requests.RequestException as exc:
+        st.error(f"API request failed: {path} -> {exc}")
+        return None
 
 
-@app.post("/api/v1/route", response_model=RouteResponse)
-async def compute_route(payload: RouteRequest):
-    from geospatial.hazard_router import HazardAwareRouter, RouteMode, RoutingError
-
-    router_engine = HazardAwareRouter()
+def _api_post_binary(path: str, raw_bytes: bytes, extra_headers: dict | None = None) -> dict | None:
+    headers = {"Content-Type": "application/octet-stream"}
+    if extra_headers:
+        headers.update(extra_headers)
     try:
-        result = await asyncio.to_thread(
-            router_engine.route,
-            payload.origin_lat,
-            payload.origin_lon,
-            payload.destination_lat,
-            payload.destination_lon,
-            payload.flood_geojson,
-            RouteMode(payload.mode),
+        resp = requests.post(f"{API_BASE}{path}", data=raw_bytes, headers=headers, timeout=20)
+        resp.raise_for_status()
+        return resp.json()
+    except requests.RequestException as exc:
+        st.error(f"API request failed: {path} -> {exc}")
+        return None
+
+
+def _api_post_file(path: str, filename: str, file_bytes: bytes, mime: str) -> dict | None:
+    try:
+        resp = requests.post(
+            f"{API_BASE}{path}",
+            files={"audio": (filename, file_bytes, mime)},
+            timeout=60,
         )
-    except RoutingError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+        resp.raise_for_status()
+        return resp.json()
+    except requests.RequestException as exc:
+        st.error(f"API request failed: {path} -> {exc}")
+        return None
 
-    return RouteResponse(
-        mode=result.mode.value,
-        coordinates=result.coordinates,
-        distance_meters=result.distance_meters,
-        estimated_duration_minutes=result.estimated_duration_minutes,
-        intersects_flood_polygon=result.intersects_flood_polygon,
+
+# --------------------------------------------------------------------------
+# Session state
+# --------------------------------------------------------------------------
+
+if "flood_mask_geojson" not in st.session_state:
+    st.session_state.flood_mask_geojson = None
+if "flood_mask_meta" not in st.session_state:
+    st.session_state.flood_mask_meta = None
+if "active_route" not in st.session_state:
+    st.session_state.active_route = None
+if "selected_victim" not in st.session_state:
+    st.session_state.selected_victim = None
+if "map_center" not in st.session_state:
+    st.session_state.map_center = None
+
+
+# --------------------------------------------------------------------------
+# Sidebar: controls
+# --------------------------------------------------------------------------
+
+with st.sidebar:
+    st.title("🌊 Flood Rescue Command")
+    st.caption(f"API: {API_BASE}")
+
+    st.subheader("📡 SAR Flood Mask")
+    sar_lat = st.number_input("AOI latitude", format="%.6f", key="sar_lat")
+    sar_lon = st.number_input("AOI longitude", format="%.6f", key="sar_lon")
+    if st.button("Fetch Sentinel-1 flood mask", use_container_width=True):
+        with st.spinner("Running SAR pipeline on Google Earth Engine..."):
+            result = _api_get(
+                "/api/v1/sar/flood_mask", latitude=sar_lat, longitude=sar_lon
+            )
+        if result:
+            st.session_state.flood_mask_geojson = result["geojson"]
+            st.session_state.flood_mask_meta = result
+            st.session_state.map_center = (sar_lat, sar_lon)
+            st.success(
+                f"Flood mask ready — water fraction {result['water_fraction']:.1%}, "
+                f"Otsu threshold {result['otsu_threshold_db']:.2f} dB"
+            )
+
+    st.divider()
+    st.subheader("🎙️ Voice Distress Intake")
+    uploaded_audio = st.file_uploader("Upload/record a distress call (WAV)", type=["wav"])
+    voice_language = st.text_input(
+        "Language code (optional, blank = auto-detect)", value="", key="voice_lang"
+    )
+    if uploaded_audio is not None and st.button("Run ASR + Triage", use_container_width=True):
+        with st.spinner("Transcribing and extracting triage data..."):
+            triage = _api_post_file(
+                "/api/v1/voice/triage", uploaded_audio.name, uploaded_audio.getvalue(), "audio/wav"
+            )
+        if triage:
+            st.json(triage)
+            st.session_state["last_triage"] = triage
+
+    if st.session_state.get("last_triage"):
+        triage = st.session_state["last_triage"]
+        st.caption("Dispatch this triage as a distress packet:")
+        col1, col2 = st.columns(2)
+        with col1:
+            dispatch_lat = st.number_input(
+                "Dispatch lat",
+                value=(triage.get("resolved_coordinates") or {}).get("lat", 0.0),
+                format="%.6f",
+                key="dispatch_lat",
+            )
+        with col2:
+            dispatch_lon = st.number_input(
+                "Dispatch lon",
+                value=(triage.get("resolved_coordinates") or {}).get("lon", 0.0),
+                format="%.6f",
+                key="dispatch_lon",
+            )
+        device_id_hash = st.number_input(
+            "Device ID hash", min_value=0, value=1, step=1, key="dispatch_device_hash"
+        )
+        if st.button("📨 Dispatch distress packet", use_container_width=True):
+            from packet.binary_protocol import (
+                BinaryDistressProtocol,
+                DistressUrgency,
+                DistressNeed,
+            )
+
+            packet = BinaryDistressProtocol.pack_payload(
+                latitude=dispatch_lat,
+                longitude=dispatch_lon,
+                urgency=DistressUrgency[triage["urgency_level"]],
+                victim_count=triage["headcount"],
+                need_code=DistressNeed[triage["need_type"]],
+                device_id_hash=int(device_id_hash),
+                battery_level=15,
+                signal_strength=15,
+            )
+            response = _api_post_binary(
+                "/api/v1/sos/ingest_binary", packet, extra_headers={"X-Received-Via": "dashboard"}
+            )
+            if response:
+                st.success(f"Dispatched distress record #{response['id']}")
+
+    st.divider()
+    st.subheader("🧭 Route Planning")
+    route_mode = st.selectbox("Mode", ["pedestrian", "boat"])
+    if st.session_state.selected_victim and st.session_state.flood_mask_geojson:
+        origin_lat = st.number_input("Rescue team lat", format="%.6f", key="origin_lat")
+        origin_lon = st.number_input("Rescue team lon", format="%.6f", key="origin_lon")
+        if st.button("Compute safe route", use_container_width=True):
+            victim_lat, victim_lon = st.session_state.selected_victim
+            with st.spinner("Computing obstacle-aware A* route..."):
+                route = _api_post_json(
+                    "/api/v1/route",
+                    {
+                        "origin_lat": origin_lat,
+                        "origin_lon": origin_lon,
+                        "destination_lat": victim_lat,
+                        "destination_lon": victim_lon,
+                        "mode": route_mode,
+                        "flood_geojson": st.session_state.flood_mask_geojson,
+                    },
+                )
+            if route:
+                st.session_state.active_route = route
+                st.success(
+                    f"Route ready: {route['distance_meters']:.0f} m, "
+                    f"~{route['estimated_duration_minutes']:.1f} min"
+                )
+    else:
+        st.caption("Select a victim pin on the map and fetch a flood mask first.")
+
+    st.divider()
+    auto_refresh = st.checkbox(
+        "Auto-refresh SOS feed", value=True,
+        help=f"Refreshes every {settings.dashboard_refresh_interval_seconds}s",
     )
 
 
-@app.post("/api/v1/voice/triage", response_model=VoiceTriageResponse)
-async def voice_triage(audio: UploadFile = File(...), language: Optional[str] = None):
-    from edge_nlp.transcriber import WhisperTranscriber
-    from edge_nlp.entity_extractor import EntityExtractor
+# --------------------------------------------------------------------------
+# Main map
+# --------------------------------------------------------------------------
 
-    audio_bytes = await audio.read()
-    if not audio_bytes:
-        raise HTTPException(status_code=400, detail="Uploaded audio file is empty.")
+st.header("🗺️ Live Tactical Map")
 
-    transcriber = WhisperTranscriber()
-    extractor = EntityExtractor()
+active = _api_get("/api/v1/sos/active_distress") or {"count": 0, "records": []}
+records = active["records"]
 
-    transcription = await asyncio.to_thread(transcriber.transcribe, audio_bytes, language)
-    if not transcription.text.strip():
-        raise HTTPException(status_code=422, detail="Transcription produced no text; audio may be silent.")
+if st.session_state.map_center:
+    center = st.session_state.map_center
+elif records:
+    center = (records[0]["latitude"], records[0]["longitude"])
+else:
+    center = (20.5937, 78.9629)  # dynamic fallback: geographic centroid input, not a "demo" location claim
 
-    triage = await asyncio.to_thread(extractor.extract, transcription.text)
+fmap = folium.Map(location=center, zoom_start=settings.dashboard_default_map_zoom, tiles="OpenStreetMap")
 
-    return VoiceTriageResponse(
-        transcript=transcription.text,
-        language=transcription.language,
-        language_probability=transcription.language_probability,
-        location_query=triage.location_query,
-        headcount=triage.headcount,
-        urgency_level=triage.urgency_level,
-        need_type=triage.need_type,
-        triage_score=triage.triage_score,
-        resolved_coordinates=triage.resolved_coordinates,
+if st.session_state.flood_mask_geojson:
+    folium.GeoJson(
+        st.session_state.flood_mask_geojson,
+        name="SAR Flood Mask",
+        style_function=lambda _: {"fillColor": "#1f77b4", "color": "#1f77b4", "fillOpacity": 0.4},
+    ).add_to(fmap)
+
+for record in records:
+    urgency = record["urgency"]
+    need = record["need_code"]
+    color = _NEED_COLOR_OVERRIDE.get(need, _URGENCY_COLORS.get(urgency, "gray"))
+    popup_html = (
+        f"<b>ID:</b> {record['id']}<br>"
+        f"<b>Urgency:</b> {urgency}<br>"
+        f"<b>Need:</b> {need}<br>"
+        f"<b>Victims:</b> {record['victim_count']}<br>"
+        f"<b>Battery:</b> {record['battery_level_0_15']}/15<br>"
+        f"<b>Received via:</b> {record['received_via']}<br>"
+        f"<b>Received at:</b> {record['received_at']}"
     )
+    marker = folium.Marker(
+        location=(record["latitude"], record["longitude"]),
+        popup=folium.Popup(popup_html, max_width=300),
+        icon=folium.Icon(color=color, icon="exclamation-triangle", prefix="fa"),
+    )
+    marker.add_to(fmap)
+
+if st.session_state.active_route and st.session_state.active_route.get("coordinates"):
+    folium.PolyLine(
+        st.session_state.active_route["coordinates"],
+        color="lime",
+        weight=5,
+        opacity=0.9,
+        tooltip=(
+            f"{st.session_state.active_route['mode'].title()} route — "
+            f"{st.session_state.active_route['distance_meters']:.0f} m"
+        ),
+    ).add_to(fmap)
+
+folium.LayerControl().add_to(fmap)
+
+map_state = st_folium(fmap, width=None, height=600, returned_objects=["last_object_clicked"])
+
+if map_state and map_state.get("last_object_clicked"):
+    clicked = map_state["last_object_clicked"]
+    st.session_state.selected_victim = (clicked["lat"], clicked["lng"])
+    st.info(f"Selected point for routing: {clicked['lat']:.5f}, {clicked['lng']:.5f}")
 
 
-@app.websocket("/ws/distress")
-async def distress_websocket(websocket: WebSocket):
-    await connection_manager.connect(websocket)
-    try:
-        while True:
-            # Clients don't need to send anything; this keeps the connection alive
-            # and detects disconnects.
-            await websocket.receive_text()
-    except WebSocketDisconnect:
-        await connection_manager.disconnect(websocket)
+# --------------------------------------------------------------------------
+# Active distress table
+# --------------------------------------------------------------------------
 
+st.header("📋 Active SOS Queue")
+if records:
+    st.dataframe(
+        [
+            {
+                "ID": r["id"],
+                "Urgency": r["urgency"],
+                "Need": r["need_code"],
+                "Victims": r["victim_count"],
+                "Lat": r["latitude"],
+                "Lon": r["longitude"],
+                "Battery": r["battery_level_0_15"],
+                "Via": r["received_via"],
+                "Received": r["received_at"],
+            }
+            for r in records
+        ],
+        use_container_width=True,
+    )
+    resolve_id = st.number_input("Resolve distress by ID", min_value=0, step=1, value=0)
+    if st.button("Mark resolved") and resolve_id > 0:
+        result = requests.post(f"{API_BASE}/api/v1/sos/{int(resolve_id)}/resolve", timeout=10)
+        if result.ok:
+            st.success(f"Resolved #{resolve_id}")
+            st.rerun()
+else:
+    st.caption("No active distress signals.")
 
-@app.get("/healthz")
-async def health_check():
-    return {"status": "ok", "service": settings.service_name, "environment": settings.environment}
+if auto_refresh:
+    time.sleep(settings.dashboard_refresh_interval_seconds)
+    st.rerun()
