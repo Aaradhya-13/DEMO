@@ -1,5 +1,6 @@
 import os
 import time
+import struct
 import requests
 import folium
 import streamlit as st
@@ -7,8 +8,10 @@ from streamlit_folium import st_folium
 
 st.set_page_config(page_title="Flood Rescue Command Dashboard", page_icon="🌊", layout="wide")
 
-# Read backend URL from Render environment or fallback to your live deployment
-API_BASE = os.getenv("DASHBOARD_API_BASE_URL", "https://demo-w8i9.onrender.com").rstrip("/")
+# Robust URL cleaning: strips hidden single/double quotes, newlines, and trailing slashes
+raw_api = os.getenv("DASHBOARD_API_BASE_URL", "https://demo-w8i9.onrender.com")
+API_BASE = raw_api.strip().strip("'\"").rstrip("/")
+
 REFRESH_INTERVAL = 10
 DEFAULT_ZOOM = 12
 
@@ -26,20 +29,22 @@ _NEED_COLOR_OVERRIDE = {
 
 def _api_get(path, **params):
     try:
-        resp = requests.get(f"{API_BASE}{path}", params=params, timeout=20)
+        url = f"{API_BASE}{path}"
+        resp = requests.get(url, params=params, timeout=20)
         resp.raise_for_status()
         return resp.json()
-    except requests.RequestException as exc:
+    except Exception as exc:
         st.error(f"API request failed: {path} -> {exc}")
         return None
 
 
 def _api_post_json(path, payload):
     try:
-        resp = requests.post(f"{API_BASE}{path}", json=payload, timeout=30)
+        url = f"{API_BASE}{path}"
+        resp = requests.post(url, json=payload, timeout=30)
         resp.raise_for_status()
         return resp.json()
-    except requests.RequestException as exc:
+    except Exception as exc:
         st.error(f"API request failed: {path} -> {exc}")
         return None
 
@@ -49,24 +54,26 @@ def _api_post_binary(path, raw_bytes, extra_headers=None):
     if extra_headers:
         headers.update(extra_headers)
     try:
-        resp = requests.post(f"{API_BASE}{path}", data=raw_bytes, headers=headers, timeout=20)
+        url = f"{API_BASE}{path}"
+        resp = requests.post(url, data=raw_bytes, headers=headers, timeout=20)
         resp.raise_for_status()
         return resp.json()
-    except requests.RequestException as exc:
+    except Exception as exc:
         st.error(f"API request failed: {path} -> {exc}")
         return None
 
 
 def _api_post_file(path, filename, file_bytes, mime):
     try:
+        url = f"{API_BASE}{path}"
         resp = requests.post(
-            f"{API_BASE}{path}",
+            url,
             files={"audio": (filename, file_bytes, mime)},
             timeout=60,
         )
         resp.raise_for_status()
         return resp.json()
-    except requests.RequestException as exc:
+    except Exception as exc:
         st.error(f"API request failed: {path} -> {exc}")
         return None
 
@@ -88,12 +95,12 @@ if "map_center" not in st.session_state:
 
 
 # --------------------------------------------------------------------------
-# Sidebar Controls
+# Sidebar: Controls
 # --------------------------------------------------------------------------
 
 with st.sidebar:
     st.title("🌊 Flood Rescue Command")
-    st.caption(f"Backend API: {API_BASE}")
+    st.caption(f"Backend API: `{API_BASE}`")
 
     st.subheader("📡 SAR Flood Mask")
     sar_lat = st.number_input("AOI Latitude", format="%.6f", key="sar_lat", value=26.8452)
@@ -148,8 +155,6 @@ with st.sidebar:
             "Device ID hash", min_value=0, value=1, step=1, key="dispatch_device_hash"
         )
         if st.button("📨 Dispatch Distress Packet", use_container_width=True):
-            import struct
-            # Pack standard 40-byte binary distress packet directly
             urgency_val = 3 if triage.get("urgency_level") == "CRITICAL" else 2
             need_val = 0 if triage.get("need_type") == "BOAT_EVACUATION" else 1
             count_val = int(triage.get("headcount", 1))
