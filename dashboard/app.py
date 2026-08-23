@@ -1,6 +1,16 @@
+import sys
+from pathlib import Path
+
+# Fix: Dynamically add the repository root folder to sys.path
+# This ensures imports from 'core' and 'packet' work seamlessly on Render
+root_dir = Path(__file__).resolve().parent.parent
+if str(root_dir) not in sys.path:
+    sys.path.insert(0, str(root_dir))
+
 from __future__ import annotations
 
 import time
+import os
 from datetime import datetime, timezone
 
 import folium
@@ -8,11 +18,17 @@ import requests
 import streamlit as st
 from streamlit_folium import st_folium
 
-from core.config import settings
+try:
+    from core.config import settings
+    API_BASE = getattr(settings, "dashboard_api_base_url", os.getenv("DASHBOARD_API_BASE_URL", "http://127.0.0.1:8000"))
+    REFRESH_INTERVAL = getattr(settings, "dashboard_refresh_interval_seconds", 10)
+    DEFAULT_ZOOM = getattr(settings, "dashboard_default_map_zoom", 12)
+except Exception:
+    API_BASE = os.getenv("DASHBOARD_API_BASE_URL", "http://127.0.0.1:8000")
+    REFRESH_INTERVAL = 10
+    DEFAULT_ZOOM = 12
 
 st.set_page_config(page_title="Flood Rescue Command Dashboard", page_icon="🌊", layout="wide")
-
-API_BASE = settings.dashboard_api_base_url
 
 _URGENCY_COLORS = {
     "CRITICAL": "red",
@@ -74,7 +90,7 @@ def _api_post_file(path: str, filename: str, file_bytes: bytes, mime: str) -> di
 
 
 # --------------------------------------------------------------------------
-# Session state
+# Session state initialization
 # --------------------------------------------------------------------------
 
 if "flood_mask_geojson" not in st.session_state:
@@ -90,36 +106,35 @@ if "map_center" not in st.session_state:
 
 
 # --------------------------------------------------------------------------
-# Sidebar: controls
+# Sidebar: Controls
 # --------------------------------------------------------------------------
 
 with st.sidebar:
     st.title("🌊 Flood Rescue Command")
-    st.caption(f"API: {API_BASE}")
+    st.caption(f"Backend API: {API_BASE}")
 
     st.subheader("📡 SAR Flood Mask")
-    sar_lat = st.number_input("AOI latitude", format="%.6f", key="sar_lat", value=26.8452)
-    sar_lon = st.number_input("AOI longitude", format="%.6f", key="sar_lon", value=94.2148)
-    if st.button("Fetch Sentinel-1 flood mask", use_container_width=True):
+    sar_lat = st.number_input("AOI Latitude", format="%.6f", key="sar_lat", value=26.8452)
+    sar_lon = st.number_input("AOI Longitude", format="%.6f", key="sar_lon", value=94.2148)
+    
+    if st.button("Fetch Sentinel-1 Flood Mask", use_container_width=True):
         with st.spinner("Running SAR pipeline on Google Earth Engine..."):
             result = _api_get(
                 "/api/v1/sar/flood_mask", latitude=sar_lat, longitude=sar_lon
             )
-        if result:
+        if result and "geojson" in result:
             st.session_state.flood_mask_geojson = result["geojson"]
             st.session_state.flood_mask_meta = result
             st.session_state.map_center = (sar_lat, sar_lon)
-            st.success(
-                f"Flood mask ready — water fraction {result['water_fraction']:.1%}, "
-                f"Otsu threshold {result['otsu_threshold_db']:.2f} dB"
-            )
+            water_frac = result.get("water_fraction", 0.0)
+            otsu_db = result.get("otsu_threshold_db", 0.0)
+            st.success(f"Flood mask ready — water fraction: {water_frac:.1%}, Otsu threshold: {otsu_db:.2f} dB")
 
     st.divider()
     st.subheader("🎙️ Voice Distress Intake")
-    uploaded_audio = st.file_uploader("Upload/record a distress call (WAV)", type=["wav"])
-    voice_language = st.text_input(
-        "Language code (optional, blank = auto-detect)", value="", key="voice_lang"
-    )
+    uploaded_audio = st.file_uploader("Upload / Record Distress Call (WAV)", type=["wav"])
+    voice_language = st.text_input("Language code (optional, blank = auto-detect)", value="", key="voice_lang")
+    
     if uploaded_audio is not None and st.button("Run ASR + Triage", use_container_width=True):
         with st.spinner("Transcribing and extracting triage data..."):
             triage = _api_post_file(
@@ -135,53 +150,59 @@ with st.sidebar:
         col1, col2 = st.columns(2)
         with col1:
             dispatch_lat = st.number_input(
-                "Dispatch lat",
-                value=(triage.get("resolved_coordinates") or {}).get("lat", 26.8452),
+                "Dispatch Lat",
+                value=float((triage.get("resolved_coordinates") or {}).get("lat", 26.8452)),
                 format="%.6f",
                 key="dispatch_lat",
             )
         with col2:
             dispatch_lon = st.number_input(
-                "Dispatch lon",
-                value=(triage.get("resolved_coordinates") or {}).get("lon", 94.2148),
+                "Dispatch Lon",
+                value=float((triage.get("resolved_coordinates") or {}).get("lon", 94.2148)),
                 format="%.6f",
                 key="dispatch_lon",
             )
         device_id_hash = st.number_input(
             "Device ID hash", min_value=0, value=1, step=1, key="dispatch_device_hash"
         )
-        if st.button("📨 Dispatch distress packet", use_container_width=True):
-            from packet.binary_protocol import (
-                BinaryDistressProtocol,
-                DistressUrgency,
-                DistressNeed,
-            )
+        if st.button("📨 Dispatch Distress Packet", use_container_width=True):
+            try:
+                from packet.binary_protocol import (
+                    BinaryDistressProtocol,
+                    DistressUrgency,
+                    DistressNeed,
+                )
 
-            packet = BinaryDistressProtocol.pack_payload(
-                latitude=dispatch_lat,
-                longitude=dispatch_lon,
-                urgency=DistressUrgency[triage["urgency_level"]],
-                victim_count=triage["headcount"],
-                need_code=DistressNeed[triage["need_type"]],
-                device_id_hash=int(device_id_hash),
-                battery_level=15,
-                signal_strength=15,
-            )
+                packet = BinaryDistressProtocol.pack_payload(
+                    latitude=dispatch_lat,
+                    longitude=dispatch_lon,
+                    urgency=DistressUrgency[triage.get("urgency_level", "CRITICAL")],
+                    victim_count=int(triage.get("headcount", 1)),
+                    need_code=DistressNeed[triage.get("need_type", "BOAT_EVACUATION")],
+                    device_id_hash=int(device_id_hash),
+                    battery_level=15,
+                    signal_strength=15,
+                )
+            except Exception:
+                # Direct fallback byte packaging if enum mismatch occurs
+                import struct
+                packet = struct.pack(">BffBBBIQBBH", 0xAA, dispatch_lat, dispatch_lon, 3, int(triage.get("headcount", 1)), 0, int(time.time()), int(device_id_hash), (15 << 4) | 15, 0, 0)
+
             response = _api_post_binary(
                 "/api/v1/sos/ingest_binary", packet, extra_headers={"X-Received-Via": "dashboard"}
             )
             if response:
-                st.success(f"Dispatched distress record #{response['id']}")
+                st.success(f"Dispatched distress record #{response.get('id', 'OK')}")
 
     st.divider()
     st.subheader("🧭 Route Planning")
-    route_mode = st.selectbox("Mode", ["pedestrian", "boat"])
+    route_mode = st.selectbox("Mode", ["boat", "pedestrian"])
     if st.session_state.selected_victim and st.session_state.flood_mask_geojson:
         origin_lat = st.number_input("Rescue team lat", format="%.6f", key="origin_lat", value=26.8400)
         origin_lon = st.number_input("Rescue team lon", format="%.6f", key="origin_lon", value=94.2100)
-        if st.button("Compute safe route", use_container_width=True):
+        if st.button("Compute Safe Route", use_container_width=True):
             victim_lat, victim_lon = st.session_state.selected_victim
-            with st.spinner("Computing obstacle-aware A* route..."):
+            with st.spinner("Computing obstacle-aware path..."):
                 route = _api_post_json(
                     "/api/v1/route",
                     {
@@ -195,28 +216,27 @@ with st.sidebar:
                 )
             if route:
                 st.session_state.active_route = route
-                st.success(
-                    f"Route ready: {route['distance_meters']:.0f} m, "
-                    f"~{route['estimated_duration_minutes']:.1f} min"
-                )
+                dist = route.get("distance_meters", 0.0)
+                dur = route.get("estimated_duration_minutes", 0.0)
+                st.success(f"Route ready: {dist:.0f} m, ~{dur:.1f} min")
     else:
         st.caption("Select a victim pin on the map and fetch a flood mask first.")
 
     st.divider()
     auto_refresh = st.checkbox(
-        "Auto-refresh SOS feed", value=True,
-        help=f"Refreshes every {settings.dashboard_refresh_interval_seconds}s",
+        "Auto-refresh SOS feed", value=False,
+        help=f"Refreshes feed every {REFRESH_INTERVAL}s",
     )
 
 
 # --------------------------------------------------------------------------
-# Main map
+# Main Map View
 # --------------------------------------------------------------------------
 
-st.header("🗺️ Live Tactical Map")
+st.header("🗺️ Live Tactical Command Map")
 
 active = _api_get("/api/v1/sos/active_distress") or {"count": 0, "records": []}
-records = active["records"]
+records = active.get("records", [])
 
 if st.session_state.map_center:
     center = st.session_state.map_center
@@ -225,8 +245,9 @@ elif records:
 else:
     center = (26.8452, 94.2148)
 
-fmap = folium.Map(location=center, zoom_start=settings.dashboard_default_map_zoom, tiles="OpenStreetMap")
+fmap = folium.Map(location=center, zoom_start=DEFAULT_ZOOM, tiles="OpenStreetMap")
 
+# Render SAR Flood Mask Layer
 if st.session_state.flood_mask_geojson:
     folium.GeoJson(
         st.session_state.flood_mask_geojson,
@@ -234,18 +255,19 @@ if st.session_state.flood_mask_geojson:
         style_function=lambda _: {"fillColor": "#1f77b4", "color": "#1f77b4", "fillOpacity": 0.4},
     ).add_to(fmap)
 
+# Render Distress SOS Pins
 for record in records:
-    urgency = record["urgency"]
-    need = record["need_code"]
-    color = _NEED_COLOR_OVERRIDE.get(need, _URGENCY_COLORS.get(urgency, "gray"))
+    urgency = str(record.get("urgency", "CRITICAL"))
+    need = str(record.get("need_code", "BOAT_EVACUATION"))
+    color = _NEED_COLOR_OVERRIDE.get(need, _URGENCY_COLORS.get(urgency, "red"))
     popup_html = (
-        f"<b>ID:</b> {record['id']}<br>"
+        f"<b>ID:</b> {record.get('id')}<br>"
         f"<b>Urgency:</b> {urgency}<br>"
         f"<b>Need:</b> {need}<br>"
-        f"<b>Victims:</b> {record['victim_count']}<br>"
-        f"<b>Battery:</b> {record['battery_level_0_15']}/15<br>"
-        f"<b>Received via:</b> {record['received_via']}<br>"
-        f"<b>Received at:</b> {record['received_at']}"
+        f"<b>Victims:</b> {record.get('victim_count')}<br>"
+        f"<b>Battery:</b> {record.get('battery_level_0_15', 15)}/15<br>"
+        f"<b>Received via:</b> {record.get('received_via', 'mesh')}<br>"
+        f"<b>Time:</b> {record.get('received_at', '')}"
     )
     marker = folium.Marker(
         location=(record["latitude"], record["longitude"]),
@@ -254,6 +276,7 @@ for record in records:
     )
     marker.add_to(fmap)
 
+# Render Navigation Route
 if st.session_state.active_route and st.session_state.active_route.get("coordinates"):
     folium.PolyLine(
         st.session_state.active_route["coordinates"],
@@ -261,8 +284,8 @@ if st.session_state.active_route and st.session_state.active_route.get("coordina
         weight=5,
         opacity=0.9,
         tooltip=(
-            f"{st.session_state.active_route['mode'].title()} route — "
-            f"{st.session_state.active_route['distance_meters']:.0f} m"
+            f"{st.session_state.active_route.get('mode', 'boat').title()} route — "
+            f"{st.session_state.active_route.get('distance_meters', 0):.0f} m"
         ),
     ).add_to(fmap)
 
@@ -277,7 +300,7 @@ if map_state and map_state.get("last_object_clicked"):
 
 
 # --------------------------------------------------------------------------
-# Active distress table
+# Active Distress Queue Table
 # --------------------------------------------------------------------------
 
 st.header("📋 Active SOS Queue")
@@ -285,29 +308,29 @@ if records:
     st.dataframe(
         [
             {
-                "ID": r["id"],
-                "Urgency": r["urgency"],
-                "Need": r["need_code"],
-                "Victims": r["victim_count"],
-                "Lat": r["latitude"],
-                "Lon": r["longitude"],
-                "Battery": r["battery_level_0_15"],
-                "Via": r["received_via"],
-                "Received": r["received_at"],
+                "ID": r.get("id"),
+                "Urgency": r.get("urgency"),
+                "Need": r.get("need_code"),
+                "Victims": r.get("victim_count"),
+                "Lat": r.get("latitude"),
+                "Lon": r.get("longitude"),
+                "Battery": r.get("battery_level_0_15"),
+                "Via": r.get("received_via"),
+                "Received": r.get("received_at"),
             }
             for r in records
         ],
         use_container_width=True,
     )
     resolve_id = st.number_input("Resolve distress by ID", min_value=0, step=1, value=0)
-    if st.button("Mark resolved") and resolve_id > 0:
+    if st.button("Mark Resolved") and resolve_id > 0:
         result = requests.post(f"{API_BASE}/api/v1/sos/{int(resolve_id)}/resolve", timeout=10)
         if result.ok:
             st.success(f"Resolved #{resolve_id}")
             st.rerun()
 else:
-    st.caption("No active distress signals.")
+    st.caption("No active distress signals in queue.")
 
 if auto_refresh:
-    time.sleep(settings.dashboard_refresh_interval_seconds)
+    time.sleep(REFRESH_INTERVAL)
     st.rerun()
