@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import struct
 import requests
@@ -8,9 +9,9 @@ from streamlit_folium import st_folium
 
 st.set_page_config(page_title="Flood Rescue Command Dashboard", page_icon="🌊", layout="wide")
 
-# Robust URL cleaning: strips hidden single/double quotes, newlines, and trailing slashes
+# Robust URL cleaning: strips leading/trailing single/double quotes, whitespaces, and trailing slashes
 raw_api = os.getenv("DASHBOARD_API_BASE_URL", "https://demo-w8i9.onrender.com")
-API_BASE = raw_api.strip().strip("'\"").rstrip("/")
+API_BASE = re.sub(r"^['\"\s]+|['\"\s]+$", "", raw_api).rstrip("/")
 
 REFRESH_INTERVAL = 10
 DEFAULT_ZOOM = 12
