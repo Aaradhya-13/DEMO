@@ -6,11 +6,8 @@ python-dotenv>=1.0.1
 # --- Binary protocol ---
 crcmod>=1.7
 
-# --- Edge NLP ---
+# --- Edge NLP (Server-side models) ---
 numpy>=1.26.0
-sounddevice>=0.4.7
-PyAudio>=0.2.14
-faster-whisper>=1.0.3
 transformers>=4.42.0
 torch>=2.3.0
 geopy>=2.4.1
