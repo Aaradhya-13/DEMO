@@ -1,33 +1,16 @@
-from __future__ import annotations
-
 import os
-import sys
-from pathlib import Path
-
-# Add project root to sys.path so 'core' and 'packet' resolve correctly
-root_dir = Path(__file__).resolve().parent.parent
-if str(root_dir) not in sys.path:
-    sys.path.insert(0, str(root_dir))
-
 import time
-from datetime import datetime, timezone
-
-import folium
 import requests
+import folium
 import streamlit as st
 from streamlit_folium import st_folium
 
-try:
-    from core.config import settings
-    API_BASE = getattr(settings, "dashboard_api_base_url", os.getenv("DASHBOARD_API_BASE_URL", "http://127.0.0.1:8000"))
-    REFRESH_INTERVAL = getattr(settings, "dashboard_refresh_interval_seconds", 10)
-    DEFAULT_ZOOM = getattr(settings, "dashboard_default_map_zoom", 12)
-except Exception:
-    API_BASE = os.getenv("DASHBOARD_API_BASE_URL", "http://127.0.0.1:8000")
-    REFRESH_INTERVAL = 10
-    DEFAULT_ZOOM = 12
-
 st.set_page_config(page_title="Flood Rescue Command Dashboard", page_icon="🌊", layout="wide")
+
+# Read backend URL from Render environment or fallback to your live deployment
+API_BASE = os.getenv("DASHBOARD_API_BASE_URL", "https://demo-w8i9.onrender.com").rstrip("/")
+REFRESH_INTERVAL = 10
+DEFAULT_ZOOM = 12
 
 _URGENCY_COLORS = {
     "CRITICAL": "red",
@@ -41,7 +24,7 @@ _NEED_COLOR_OVERRIDE = {
 }
 
 
-def _api_get(path: str, **params) -> dict | None:
+def _api_get(path, **params):
     try:
         resp = requests.get(f"{API_BASE}{path}", params=params, timeout=20)
         resp.raise_for_status()
@@ -51,7 +34,7 @@ def _api_get(path: str, **params) -> dict | None:
         return None
 
 
-def _api_post_json(path: str, payload: dict) -> dict | None:
+def _api_post_json(path, payload):
     try:
         resp = requests.post(f"{API_BASE}{path}", json=payload, timeout=30)
         resp.raise_for_status()
@@ -61,7 +44,7 @@ def _api_post_json(path: str, payload: dict) -> dict | None:
         return None
 
 
-def _api_post_binary(path: str, raw_bytes: bytes, extra_headers: dict | None = None) -> dict | None:
+def _api_post_binary(path, raw_bytes, extra_headers=None):
     headers = {"Content-Type": "application/octet-stream"}
     if extra_headers:
         headers.update(extra_headers)
@@ -74,7 +57,7 @@ def _api_post_binary(path: str, raw_bytes: bytes, extra_headers: dict | None = N
         return None
 
 
-def _api_post_file(path: str, filename: str, file_bytes: bytes, mime: str) -> dict | None:
+def _api_post_file(path, filename, file_bytes, mime):
     try:
         resp = requests.post(
             f"{API_BASE}{path}",
@@ -89,7 +72,7 @@ def _api_post_file(path: str, filename: str, file_bytes: bytes, mime: str) -> di
 
 
 # --------------------------------------------------------------------------
-# Session state initialization
+# Session State Initialization
 # --------------------------------------------------------------------------
 
 if "flood_mask_geojson" not in st.session_state:
@@ -105,7 +88,7 @@ if "map_center" not in st.session_state:
 
 
 # --------------------------------------------------------------------------
-# Sidebar: Controls
+# Sidebar Controls
 # --------------------------------------------------------------------------
 
 with st.sidebar:
@@ -115,7 +98,7 @@ with st.sidebar:
     st.subheader("📡 SAR Flood Mask")
     sar_lat = st.number_input("AOI Latitude", format="%.6f", key="sar_lat", value=26.8452)
     sar_lon = st.number_input("AOI Longitude", format="%.6f", key="sar_lon", value=94.2148)
-    
+
     if st.button("Fetch Sentinel-1 Flood Mask", use_container_width=True):
         with st.spinner("Running SAR pipeline on Google Earth Engine..."):
             result = _api_get(
@@ -133,7 +116,7 @@ with st.sidebar:
     st.subheader("🎙️ Voice Distress Intake")
     uploaded_audio = st.file_uploader("Upload / Record Distress Call (WAV)", type=["wav"])
     voice_language = st.text_input("Language code (optional, blank = auto-detect)", value="", key="voice_lang")
-    
+
     if uploaded_audio is not None and st.button("Run ASR + Triage", use_container_width=True):
         with st.spinner("Transcribing and extracting triage data..."):
             triage = _api_post_file(
@@ -165,26 +148,26 @@ with st.sidebar:
             "Device ID hash", min_value=0, value=1, step=1, key="dispatch_device_hash"
         )
         if st.button("📨 Dispatch Distress Packet", use_container_width=True):
-            try:
-                from packet.binary_protocol import (
-                    BinaryDistressProtocol,
-                    DistressUrgency,
-                    DistressNeed,
-                )
-
-                packet = BinaryDistressProtocol.pack_payload(
-                    latitude=dispatch_lat,
-                    longitude=dispatch_lon,
-                    urgency=DistressUrgency[triage.get("urgency_level", "CRITICAL")],
-                    victim_count=int(triage.get("headcount", 1)),
-                    need_code=DistressNeed[triage.get("need_type", "BOAT_EVACUATION")],
-                    device_id_hash=int(device_id_hash),
-                    battery_level=15,
-                    signal_strength=15,
-                )
-            except Exception:
-                import struct
-                packet = struct.pack(">BffBBBIQBBH", 0xAA, dispatch_lat, dispatch_lon, 3, int(triage.get("headcount", 1)), 0, int(time.time()), int(device_id_hash), (15 << 4) | 15, 0, 0)
+            import struct
+            # Pack standard 40-byte binary distress packet directly
+            urgency_val = 3 if triage.get("urgency_level") == "CRITICAL" else 2
+            need_val = 0 if triage.get("need_type") == "BOAT_EVACUATION" else 1
+            count_val = int(triage.get("headcount", 1))
+            
+            packet = struct.pack(
+                ">BffBBBIQBBH",
+                0xAA,
+                dispatch_lat,
+                dispatch_lon,
+                urgency_val,
+                count_val,
+                need_val,
+                int(time.time()),
+                int(device_id_hash),
+                (15 << 4) | 15,
+                0,
+                0x1234
+            )
 
             response = _api_post_binary(
                 "/api/v1/sos/ingest_binary", packet, extra_headers={"X-Received-Via": "dashboard"}
