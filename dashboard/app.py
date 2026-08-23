@@ -1,16 +1,15 @@
+from __future__ import annotations
+
+import os
 import sys
 from pathlib import Path
 
-# Fix: Dynamically add the repository root folder to sys.path
-# This ensures imports from 'core' and 'packet' work seamlessly on Render
+# Add project root to sys.path so 'core' and 'packet' resolve correctly
 root_dir = Path(__file__).resolve().parent.parent
 if str(root_dir) not in sys.path:
     sys.path.insert(0, str(root_dir))
 
-from __future__ import annotations
-
 import time
-import os
 from datetime import datetime, timezone
 
 import folium
@@ -184,7 +183,6 @@ with st.sidebar:
                     signal_strength=15,
                 )
             except Exception:
-                # Direct fallback byte packaging if enum mismatch occurs
                 import struct
                 packet = struct.pack(">BffBBBIQBBH", 0xAA, dispatch_lat, dispatch_lon, 3, int(triage.get("headcount", 1)), 0, int(time.time()), int(device_id_hash), (15 << 4) | 15, 0, 0)
 
